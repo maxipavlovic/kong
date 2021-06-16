@@ -12,12 +12,13 @@ local utils = require("kong.tools.utils")
 local constants = require("kong.constants")
 local openssl_x509 = require("resty.openssl.x509")
 local string = string
-local assert = assert
 local setmetatable = setmetatable
 local type = type
 local math = math
 local pcall = pcall
 local pairs = pairs
+local ipairs = ipairs
+local tonumber = tonumber
 local tostring = tostring
 local ngx = ngx
 local ngx_log = ngx.log
@@ -31,15 +32,18 @@ local ngx_now = ngx.now
 local ngx_var = ngx.var
 local table_insert = table.insert
 local table_remove = table.remove
+local table_concat = table.concat
 local deflate_gzip = utils.deflate_gzip
 
 
 local KONG_VERSION = kong.version
-local ngx_ERR = ngx.ERR
 local ngx_DEBUG = ngx.DEBUG
-local ngx_WARN = ngx.WARN
+local ngx_INFO = ngx.INFO
 local ngx_NOTICE = ngx.NOTICE
+local ngx_WARN = ngx.WARN
+local ngx_ERR = ngx.ERR
 local ngx_OK = ngx.OK
+local ngx_CLOSE = ngx.HTTP_CLOSE
 local MAX_PAYLOAD = constants.CLUSTERING_MAX_PAYLOAD
 local WS_OPTS = {
   timeout = constants.CLUSTERING_TIMEOUT,
@@ -49,6 +53,46 @@ local PING_INTERVAL = constants.CLUSTERING_PING_INTERVAL
 local PING_WAIT = PING_INTERVAL * 1.5
 local OCSP_TIMEOUT = constants.CLUSTERING_OCSP_TIMEOUT
 local CLUSTERING_SYNC_STATUS = constants.CLUSTERING_SYNC_STATUS
+local MAJOR_MINOR_PATTERN = "^(%d+)%.(%d+)%.%d+"
+
+
+local function extract_major_minor(version)
+  if type(version) ~= "string" then
+    return nil, nil
+  end
+
+  local major, minor = version:match(MAJOR_MINOR_PATTERN)
+  if not major then
+    return nil, nil
+  end
+
+  major = tonumber(major, 10)
+  minor = tonumber(minor, 10)
+
+  return major, minor
+end
+
+
+local function plugins_list_to_map(plugins_list)
+  local versions = {}
+  for _, plugin in ipairs(plugins_list) do
+    local name = plugin.name
+    local version = plugin.version
+    local major, minor = extract_major_minor(plugin.version)
+
+    if major and minor then
+      versions[name] = {
+        major   = major,
+        minor   = minor,
+        version = version,
+      }
+
+    else
+      versions[name] = {}
+    end
+  end
+  return versions
+end
 
 
 local function is_timeout(err)
@@ -73,6 +117,13 @@ function _M:export_deflated_reconfigure_payload()
   local config_table, err = declarative.export_config()
   if not config_table then
     return nil, err
+  end
+
+  self.plugins_configured = {}
+  if config_table.plugins then
+    for _, plugin in pairs(config_table.plugins) do
+      self.plugins_configured[plugin.name] = true
+    end
   end
 
   local payload, err = cjson_encode({
@@ -112,25 +163,31 @@ function _M:push_config()
   ngx_log(ngx_DEBUG, "config pushed to ", n, " clients")
 end
 
+
 function _M:validate_shared_cert()
   local cert = ngx_var.ssl_client_raw_cert
 
   if not cert then
-    ngx_log(ngx_ERR, "Data Plane failed to present client certificate " ..
-                     "during handshake")
-    return ngx_exit(444)
+    return nil, "data plane failed to present client certificate during handshake"
   end
 
-  cert = assert(openssl_x509.new(cert, "PEM"))
-  local digest = assert(cert:digest("sha256"))
+  local err
+  cert, err = openssl_x509.new(cert, "PEM")
+  if not cert then
+    return nil, "unable to load data plane client certificate during handshake: " .. err
+  end
+
+  local digest, err = cert:digest("sha256")
+  if not digest then
+    return nil, "unable to retrieve data plane client certificate digest during handshake: " .. err
+  end
 
   if digest ~= self.cert_digest then
-    ngx_log(ngx_ERR, "Data Plane presented incorrect client certificate " ..
-                     "during handshake, expected digest: " ..
-                     self.cert_digest ..
-                     " got: " .. digest)
-    return ngx_exit(444)
+    return nil, "data plane presented incorrect client certificate during handshake (expected: " ..
+                self.cert_digest .. ", got: " .. digest .. ")"
   end
+
+  return true
 end
 
 
@@ -196,127 +253,271 @@ do
 end
 
 
-local MAJOR_MINOR_PATTERN = "^(%d+)%.(%d+)%.%d+"
+function _M:check_version_compatibility(dp_version, dp_plugin_map, dp)
+  local major_cp, minor_cp = extract_major_minor(KONG_VERSION)
+  local major_dp, minor_dp = extract_major_minor(dp_version)
 
-function _M:should_send_config_update(node_version, node_plugins)
-  if not node_version or not node_plugins then
-    return false, "your DP did not provide version information to the CP, " ..
-                  "Kong CP after 2.3 requires such information in order to " ..
-                  "ensure generated config is compatible with DPs. " ..
-                  "Sync is suspended for this DP and will resume " ..
-                  "automatically once this DP also upgrades to 2.3 or later"
+  if not major_cp then
+    return nil, "data plane version " .. dp_version .. " is incompatible with control plane version",
+                CLUSTERING_SYNC_STATUS.KONG_VERSION_INCOMPATIBLE
   end
 
-  local major_cp, minor_cp = KONG_VERSION:match(MAJOR_MINOR_PATTERN)
-  local major_node, minor_node = node_version:match(MAJOR_MINOR_PATTERN)
-  minor_cp = tonumber(minor_cp)
-  minor_node = tonumber(minor_node)
-
-  if major_cp ~= major_node or minor_cp - 2 > minor_node or minor_cp < minor_node then
-    return false, "version incompatible, CP version: " .. KONG_VERSION ..
-                  " DP version: " .. node_version ..
-                  " DP versions acceptable are " ..
-                  major_cp .. "." .. math.max(0, minor_cp - 2) .. " to " ..
-                  major_cp .. "." .. minor_cp .. "(edges included)",
-                  CLUSTERING_SYNC_STATUS.KONG_VERSION_INCOMPATIBLE
+  if not major_dp then
+    return nil, "data plane version is incompatible with control plane version " ..
+                KONG_VERSION .. " (" .. major_cp .. ".x.y are accepted)",
+                CLUSTERING_SYNC_STATUS.KONG_VERSION_INCOMPATIBLE
   end
 
-  -- allow DP to have a superset of CP's plugins
-  local p, np
-  local i, j = #self.plugins_list, #node_plugins
-
-  if j < i then
-    return false, "CP and DP does not have same set of plugins installed",
-                  CLUSTERING_SYNC_STATUS.PLUGIN_SET_INCOMPATIBLE
+  if major_cp ~= major_dp then
+    return nil, "data plane version " .. dp_version ..
+                " is incompatible with control plane version " ..
+                KONG_VERSION .. " (" .. major_cp .. ".x.y are accepted)",
+                CLUSTERING_SYNC_STATUS.KONG_VERSION_INCOMPATIBLE
   end
 
-  while i > 0 and j > 0 do
-    p = self.plugins_list[i]
-    np = node_plugins[j]
+  if minor_cp ~= minor_dp then
+    local difference = math.abs(minor_cp - minor_dp)
+    if difference > 0 then
+      local msg = "data plane minor version " .. dp_version ..
+                  " is different to control plane minor version " ..
+                  KONG_VERSION
 
-    if p.name ~= np.name then
-      goto continue
-    end
-
-    -- ignore plugins without a version (route-by-header is deprecated)
-    if p.version and np.version then
-      -- major/minor check that ignores anything after the second digit
-      local major_minor_p = p.version:match("^(%d+%.%d+)") or "not_a_version"
-      local major_minor_np = np.version:match("^(%d+%.%d+)") or "still_not_a_version"
-
-      if major_minor_p ~= major_minor_np then
-        return false, "plugin \"" .. p.name .. "\" version incompatible, " ..
-                      "CP version: " .. tostring(p.version) ..
-                      " DP version: " .. tostring(np.version) ..
-                      " DP plugin version acceptable is "..
-                      major_minor_p .. ".x",
-                      CLUSTERING_SYNC_STATUS.PLUGIN_VERSION_INCOMPATIBLE
+      if difference == 1 then
+        ngx_log(ngx_DEBUG, msg, dp)
+      elseif difference == 2 then
+        ngx_log(ngx_INFO, msg, dp)
+      elseif difference == 3 then
+        ngx_log(ngx_NOTICE, msg, dp)
+      else
+        ngx_log(ngx_WARN, msg, dp)
       end
     end
-
-    i = i - 1
-    ::continue::
-    j = j - 1
   end
 
-  if i > 0 then
-    return false, "CP and DP does not have same set of plugins installed",
-                  CLUSTERING_SYNC_STATUS.PLUGIN_SET_INCOMPATIBLE
+  for _, plugin in ipairs(self.plugins_list) do
+    local name = plugin.name
+    local cp_plugin = self.plugins_map[name]
+    local dp_plugin = dp_plugin_map[name]
+
+    if not dp_plugin then
+      if cp_plugin.version then
+        ngx_log(ngx_WARN, name, " plugin ", cp_plugin.version, " is missing from data plane", dp)
+      else
+        ngx_log(ngx_WARN, name, " plugin is missing from data plane", dp)
+      end
+
+    else
+      if cp_plugin.version and dp_plugin.version then
+        local msg = "data plane " .. name .. " plugin version " .. dp_plugin.version ..
+                    " is different to control plane plugin version " .. cp_plugin.version
+
+        if cp_plugin.major ~= dp_plugin.major then
+          ngx_log(ngx_WARN, msg, cp_plugin.version, dp)
+
+        else
+          local difference = math.abs(cp_plugin.minor - dp_plugin.minor)
+          if difference > 0 then
+            if difference == 1 then
+              ngx_log(ngx_DEBUG, msg, dp)
+            elseif difference == 2 then
+              ngx_log(ngx_INFO, msg, dp)
+            else
+              ngx_log(ngx_NOTICE, msg, dp)
+            end
+          end
+        end
+
+      elseif dp_plugin.version then
+        ngx_log(ngx_NOTICE, "data plane ", name, " plugin version ", dp_plugin.version,
+                            " has unspecified version on control plane", dp)
+
+      elseif cp_plugin.version then
+        ngx_log(ngx_NOTICE, "data plane ", name, " plugin version is unspecified, ",
+                            "and is different to control plane plugin version ",
+                            cp_plugin.version, dp)
+      end
+    end
   end
 
-  return true
+  return true, nil, CLUSTERING_SYNC_STATUS.NORMAL
 end
 
 
-function _M:handle_cp_websocket()
-  -- use mutual TLS authentication
-  if self.conf.cluster_mtls == "shared" then
-    self:validate_shared_cert()
+function _M:check_configuration_compatibility(dp_plugin_map)
+  for _, plugin in ipairs(self.plugins_list) do
+    if self.plugins_configured[plugin.name] then
+      local name = plugin.name
+      local cp_plugin = self.plugins_map[name]
+      local dp_plugin = dp_plugin_map[name]
 
-  elseif self.conf.cluster_ocsp ~= "off" then
-    local res, err = check_for_revocation_status()
-    if res == false then
-      ngx_log(ngx_ERR, "DP client certificate was revoked: ", err)
-      return ngx_exit(444)
+      if not dp_plugin then
+        if cp_plugin.version then
+          return nil, "configured " .. name .. " plugin " .. cp_plugin.version ..
+                      " is missing from data plane", CLUSTERING_SYNC_STATUS.PLUGIN_SET_INCOMPATIBLE
+        end
 
-    elseif not res then
-      ngx_log(ngx_WARN, "DP client certificate revocation check failed: ", err)
-      if self.conf.cluster_ocsp == "on" then
-        return ngx_exit(444)
+        return nil, "configured " .. name .. " plugin is missing from data plane",
+               CLUSTERING_SYNC_STATUS.PLUGIN_SET_INCOMPATIBLE
+      end
+
+      if cp_plugin.version and dp_plugin.version then
+        local msg = "configured data plane " .. name .. " plugin version " .. dp_plugin.version ..
+                    " is different to control plane plugin version " .. cp_plugin.version
+
+        if cp_plugin.major ~= dp_plugin.major then
+          return nil, msg, CLUSTERING_SYNC_STATUS.PLUGIN_VERSION_INCOMPATIBLE
+        end
       end
     end
   end
 
-  local node_id = ngx_var.arg_node_id
-  if not node_id then
+  -- TODO: DAOs are not checked in any way at the moment. For example if plugin introduces a new DAO in
+  --       minor release and it has entities, that will most likely fail on data plane side, but is not
+  --       checked here.
+
+  return true, nil, CLUSTERING_SYNC_STATUS.NORMAL
+end
+
+function _M:handle_cp_websocket()
+  local dp_id = ngx_var.arg_node_id
+  local dp_hostname = ngx_var.arg_node_hostname
+  local dp_ip = ngx_var.remote_addr
+  local dp_version = ngx_var.arg_node_version
+
+  local dp = {}
+  if type(dp_id) == "string" then
+    table_insert(dp, "id: " .. dp_id)
+  end
+
+  if type(dp_hostname) == "string" then
+    table_insert(dp, "host: " .. dp_hostname)
+  end
+
+  if type(dp_ip) == "string" then
+    table_insert(dp, "ip: " .. dp_ip)
+  end
+
+  if type(dp_version) == "string" then
+    table_insert(dp, "version: " .. dp_version)
+  end
+
+  if #dp > 0 then
+    dp = " [" .. table_concat(dp, ", ") .. "]"
+  else
+    dp = ""
+  end
+
+  local ok, err
+
+  -- use mutual TLS authentication
+  if self.conf.cluster_mtls == "shared" then
+    ok, err = self:validate_shared_cert()
+
+  elseif self.conf.cluster_ocsp ~= "off" then
+    ok, err = check_for_revocation_status()
+    if ok == false then
+      err = "data plane client certificate was revoked: " ..  err
+
+    elseif not ok then
+      if self.conf.cluster_ocsp == "on" then
+        err = "data plane client certificate revocation check failed: " .. err
+
+      else
+        ngx_log(ngx_WARN, "data plane client certificate revocation check failed: ", err, dp)
+        err = nil
+      end
+    end
+  end
+
+  if err then
+    ngx_log(ngx_ERR, err, dp)
+    return ngx_exit(ngx_CLOSE)
+  end
+
+  if not dp_id then
+    ngx_log(ngx_WARN, "data plane didn't pass the id", dp)
     ngx_exit(400)
   end
 
-  local node_hostname = ngx_var.arg_node_hostname
-  local node_ip = ngx_var.remote_addr
-  local node_version = ngx_var.arg_node_version
-  local node_plugins
+  if not dp_version then
+    ngx_log(ngx_WARN, "data plane didn't pass the version", dp)
+    ngx_exit(400)
+  end
 
   local wb, err = ws_server:new(WS_OPTS)
   if not wb then
-    ngx_log(ngx_ERR, "failed to perform server side WebSocket handshake: ", err)
-    return ngx_exit(444)
+    ngx_log(ngx_ERR, "failed to perform server side websocket handshake: ", err, dp)
+    return ngx_exit(ngx_CLOSE)
   end
 
   -- connection established
-  -- receive basic_info
+  -- receive basic info
   local data, typ
   data, typ, err = wb:recv_frame()
   if err then
-    ngx_log(ngx_ERR, "failed to receive WebSocket basic_info frame: ", err)
-    wb:close()
-    return ngx_exit(444)
+    err = "failed to receive websocket basic info frame: " .. err
 
   elseif typ == "binary" then
-    data = cjson_decode(data)
-    assert(data.type =="basic_info")
-    node_plugins = assert(data.plugins)
+    if not data then
+      err = "failed to receive websocket basic info data"
+
+    else
+      data, err = cjson_decode(data)
+      if type(data) ~= "table" then
+        if err then
+          err = "failed to decode websocket basic info data: " .. err
+        else
+          err = "failed to decode websocket basic info data"
+        end
+
+      else
+        if data.type ~= "basic_info" then
+          err =  "invalid basic info data type: " .. (data.type  or "unknown")
+
+        else
+          if type(data.plugins) ~= "table" then
+            err =  "missing plugins in basic info data"
+          end
+        end
+      end
+    end
   end
+
+  if err then
+    ngx_log(ngx_ERR, err, dp)
+    wb:send_close()
+    return ngx_exit(ngx_CLOSE)
+  end
+
+  local dp_plugins_map = plugins_list_to_map(data.plugins)
+  local config_hash = "unknown"
+  local last_seen = ngx_time()
+  local sync_status = CLUSTERING_SYNC_STATUS.UNKNOWN
+  local purge_delay = self.conf.cluster_data_plane_purge_delay
+  local update_sync_status = function()
+    last_seen = ngx_time()
+    ok, err = kong.db.clustering_data_planes:upsert({ id = dp_id, }, {
+      last_seen = last_seen,
+      config_hash = config_hash ~= "" and config_hash or nil,
+      hostname = dp_hostname,
+      ip = dp_ip,
+      version = dp_version,
+      sync_status = sync_status, -- TODO: import may have been failed though
+    }, { ttl = purge_delay })
+    if not ok then
+      ngx_log(ngx_ERR, "unable to update clustering data plane status: ", err, dp)
+    end
+  end
+
+  ok, err, sync_status = self:check_version_compatibility(dp_version, dp_plugins_map, dp)
+  if not ok then
+    update_sync_status()
+    ngx_log(ngx_ERR, err, dp)
+    wb:send_close()
+    return ngx_exit(ngx_CLOSE)
+  end
+
+  ngx.log(ngx.DEBUG, "data plane connected", dp)
 
   local queue
   do
@@ -333,44 +534,33 @@ function _M:handle_cp_websocket()
 
   self.clients[wb] = queue
 
-  local res, sync_status
-  res, err, sync_status = self:should_send_config_update(node_version, node_plugins)
-  if res then
-    sync_status = CLUSTERING_SYNC_STATUS.NORMAL
-    if not self.deflated_reconfigure_payload then
-      assert(self:export_deflated_reconfigure_payload())
-    end
+  if not self.deflated_reconfigure_payload then
+    ok, err = self:export_deflated_reconfigure_payload()
+  end
 
-    if self.deflated_reconfigure_payload then
-      table_insert(queue, self.deflated_reconfigure_payload)
-      queue.post()
-
-    else
-      ngx_log(ngx_ERR, "unable to export config from database: ".. err)
-    end
+  if self.deflated_reconfigure_payload then
+    table_insert(queue, self.deflated_reconfigure_payload)
+    queue.post()
 
   else
-    ngx_log(ngx_WARN, "unable to send updated configuration to " ..
-                      "DP node with hostname: " .. node_hostname ..
-                      " ip: " .. node_ip ..
-                      " reason: " .. err)
+    ngx_log(ngx_ERR, "unable to send initial configuration to data plane: ", err, dp)
   end
-  -- how CP connection management works:
+
+  -- how control plane connection management works:
   -- two threads are spawned, when any of these threads exits,
   -- it means a fatal error has occurred on the connection,
   -- and the other thread is also killed
   --
-  -- * read_thread: it is the only thread that receives WS frames from the DP
-  --                and records the current DP status in the database,
-  --                and is also responsible for handling timeout detection
-  -- * write_thread: it is the only thread that sends WS frames to the DP by
-  --                 grabbing any messages currently in the send queue and
-  --                 send them to the DP in a FIFO order. Notice that the
+  -- * read_thread: it is the only thread that receives websocket frames from the
+  --                data plane and records the current data plane status in the
+  --                database, and is also responsible for handling timeout detection
+  -- * write_thread: it is the only thread that sends websocket frames to the data plane
+  --                 by grabbing any messages currently in the send queue and
+  --                 send them to the data plane in a FIFO order. Notice that the
   --                 PONG frames are also sent by this thread after they are
   --                 queued by the read_thread
 
   local read_thread = ngx.thread.spawn(function()
-    local last_seen = ngx_time()
     while not exiting() do
       local data, typ, err = wb:recv_frame()
 
@@ -386,7 +576,7 @@ function _M:handle_cp_websocket()
         local waited = ngx_time() - last_seen
         if waited > PING_WAIT then
           return nil, "did not receive ping frame from data plane within " ..
-                      PING_WAIT .. " seconds"
+            PING_WAIT .. " seconds"
         end
 
       else
@@ -400,27 +590,16 @@ function _M:handle_cp_websocket()
 
         -- dps only send pings
         if typ ~= "ping" then
-          return nil, "invalid websocket frame received from a data plane: " .. typ
+          return nil, "invalid websocket frame received from data plane: " .. typ
         end
+
+        config_hash = data
 
         -- queue PONG to avoid races
         table_insert(queue, "PONG")
         queue.post()
 
-        last_seen = ngx_time()
-
-        local ok
-        ok, err = kong.db.clustering_data_planes:upsert({ id = node_id, }, {
-          last_seen = last_seen,
-          config_hash = data ~= "" and data or nil,
-          hostname = node_hostname,
-          ip = node_ip,
-          version = node_version,
-          sync_status = sync_status,
-        }, { ttl = self.conf.cluster_data_plane_purge_delay, })
-        if not ok then
-          ngx_log(ngx_ERR, "unable to update clustering data plane status: ", err)
-        end
+        update_sync_status()
       end
     end
   end)
@@ -444,33 +623,30 @@ function _M:handle_cp_websocket()
               return nil, "failed to send PONG back to data plane: " .. err
             end
 
-            ngx_log(ngx_NOTICE, "failed to send PONG back to data plane: ", err)
+            ngx_log(ngx_NOTICE, "failed to send PONG back to data plane: ", err, dp)
 
           else
-            ngx_log(ngx_DEBUG, "sent PONG packet to data plane")
+            ngx_log(ngx_DEBUG, "sent PONG packet to data plane", dp)
           end
 
         else
-          ok, err = self:should_send_config_update(node_version, node_plugins)
+          ok, err, sync_status = self:check_configuration_compatibility(dp_plugins_map)
           if ok then
             -- config update
             local _, err = wb:send_binary(payload)
             if err then
               if not is_timeout(err) then
-                return nil, "unable to send updated configuration to node: " .. err
+                return nil, "unable to send updated configuration to data plane: " .. err
               end
 
-              ngx_log(ngx_NOTICE, "unable to send updated configuration to node: ", err)
+              ngx_log(ngx_NOTICE, "unable to send updated configuration to data plane: ", err, dp)
 
             else
-              ngx_log(ngx_DEBUG, "sent config update to node")
+              ngx_log(ngx_DEBUG, "sent config update to data plane", dp)
             end
 
           else
-            ngx_log(ngx_WARN, "unable to send updated configuration to " ..
-                              "DP node with hostname: " .. node_hostname ..
-                              " ip: " .. node_ip ..
-                              " reason: " .. err)
+            ngx_log(ngx_WARN, "unable to send updated configuration to data plane: ", err, dp)
           end
         end
 
@@ -480,20 +656,25 @@ function _M:handle_cp_websocket()
     end
   end)
 
-  local ok, err, perr = ngx.thread.wait(write_thread, read_thread)
+  local perr
+  ok, err, perr = ngx.thread.wait(write_thread, read_thread)
 
   ngx.thread.kill(write_thread)
   ngx.thread.kill(read_thread)
 
   wb:send_close()
 
+  --TODO: should we update disconnect data plane status?
+  --sync_status = CLUSTERING_SYNC_STATUS.UNKNOWN
+  --update_sync_status()
+
   if not ok then
-    ngx_log(ngx_ERR, err)
+    ngx_log(ngx_ERR, err, dp)
     return ngx_exit(ngx_ERR)
   end
 
   if perr then
-    ngx_log(ngx_ERR, perr)
+    ngx_log(ngx_ERR, perr, dp)
     return ngx_exit(ngx_ERR)
   end
 
@@ -549,6 +730,17 @@ end
 function _M:init_worker()
   -- ROLE = "control_plane"
 
+  self.plugins_map = plugins_list_to_map(self.plugins_list)
+
+  self.deflated_reconfigure_payload = nil
+  self.plugins_configured = {}
+  self.plugin_versions = {}
+
+  for i = 1, #self.plugins_list do
+    local plugin = self.plugins_list[i]
+    self.plugin_versions[plugin.name] = plugin.version
+  end
+
   local push_config_semaphore = semaphore.new()
 
   -- Sends "clustering", "push_config" to all workers in the same node, including self
@@ -589,13 +781,13 @@ function _M:init_worker()
   -- The "dao:crud" event is triggered using post_local, which eventually generates an
   -- ""clustering:push_config" cluster event. It is assumed that the workers in the
   -- same node where the dao:crud event originated will "know" about the update mostly via
-  -- changes in the cache shared dict. Since DPs don't use the cache, nodes in the same
+  -- changes in the cache shared dict. Since data planes don't use the cache, nodes in the same
   -- kong node where the event originated will need to be notified so they push config to
-  -- their DPs
+  -- their data planes
   kong.worker_events.register(handle_dao_crud_event, "dao:crud")
 
   -- When "clustering", "push_config" worker event is received by a worker,
-  -- it loads and pushes the config to its the connected DPs
+  -- it loads and pushes the config to its the connected data planes
   kong.worker_events.register(function(_)
     if push_config_semaphore:count() <= 0 then
       -- the following line always executes immediately after the `if` check
